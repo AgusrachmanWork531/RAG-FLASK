@@ -124,3 +124,6 @@ dmypy.json
 
 run_clean_cache.sh
 documents/
+
+CLAUDE.md
+.claude

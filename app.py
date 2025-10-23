@@ -9,6 +9,7 @@ from werkzeug.utils import secure_filename
 import threading
 import requests
 import json
+from flask_socketio import SocketIO, emit
 
 
 # --- KONFIGURASI ---
@@ -32,6 +33,9 @@ CHUNK_OVERLAP = 50
 
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+
+# initialize Flask and SocketIO
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
@@ -150,7 +154,7 @@ JAWABAN:"""
         payload = {
             "model": OLLAMA_MODEL_NAME,
             "prompt": prompt,
-            "stream": False,
+            "stream": True,
             "options": {
                 "temperature": 0.7,
                 "top_p": 0.9,
@@ -193,7 +197,118 @@ JAWABAN:"""
         return f"Maaf, saya mengalami error: {str(e)}"
 
 
-# API UNTUK BERTANYA
+def generate_answer_with_qwen_streaming(query, contexts, session_id):
+    """MENGHASILKAN JAWABAN MENGGUNAKAN QWEN MELALUI OLLAMA API DENGAN STREAMING."""
+    try:
+        # Buat prompt untuk Qwen
+        prompt_template = """Kamu adalah asisten AI yang membantu menjawab pertanyaan berdasarkan konteks yang diberikan.
+        KONTEKS:
+        {context}
+        PERTANYAAN: {question}
+        INSTRUKSI:
+        1. Jawab pertanyaan berdasarkan informasi dari konteks di atas
+        2. Jika informasi ada di konteks, berikan jawaban yang jelas dan ringkas
+        3. Jika informasi tidak ada di konteks, katakan "Maaf, saya tidak menemukan informasi tersebut dalam dokumen"
+        4. Jangan mengarang informasi yang tidak ada di konteks
+        5. Jawab dalam bahasa Indonesia
+        JAWABAN:"""
+        context_str = "\n\n---\n\n".join(contexts)
+        prompt = prompt_template.format(context=context_str, question=query)
+        # Kirim request ke Ollama API
+        payload = {
+            "model": OLLAMA_MODEL_NAME,
+            "prompt": prompt,
+            "stream": True,
+            "options": {
+                "temperature": 0.7,
+                "top_p": 0.9,
+                "top_k": 40,
+                "num_predict": 512,
+                "num_ctx": 2048,
+                "repeat_penalty": 1.1
+            }
+        }
+
+        print(
+            f"Mengirim request ke Ollama dengan model {OLLAMA_MODEL_NAME}...")
+
+        socketio.emit('stream_start', {
+            'session_id': session_id,
+            'status': 'generating'
+        })
+
+        response = requests.post(
+            OLLAMA_API_URL,
+            json=payload,
+            timeout=120,  # Timeout 2 menit
+            stream=True
+        )
+        if response.status_code == 200:
+            full_answer = ""
+            for line in response.iter_lines():
+                if line:
+                    try:
+                        # Parse JSON response dari Ollama
+                        chunk_data = json.loads(line.decode('utf-8'))
+
+                        # Ambil token response
+                        token = chunk_data.get('response', '')
+
+                        if token:
+                            full_answer += token
+                            # Emit token ke client via WebSocket
+                            socketio.emit('stream_token', {
+                                'session_id': session_id,
+                                'token': token
+                            })
+
+                        # Cek apakah streaming selesai
+                        if chunk_data.get('done', False):
+                            socketio.emit('stream_end', {
+                                'session_id': session_id,
+                                'status': 'completed',
+                                'full_answer': full_answer
+                            })
+                            break
+                    except json.JSONDecodeError as e:
+                        print(f"Error parsing JSON: {e}")
+                        continue
+
+            return full_answer.strip() if full_answer else "Maaf, tidak ada respons yang dihasilkan."
+        else:
+            error_msg = f"Error dari Ollama API: {response.status_code} - {response.text}"
+            print(error_msg)
+            socketio.emit('stream_error', {
+                'session_id': session_id,
+                'error': f"Error dari Ollama API: {response.status_code}"
+            })
+            return f"Maaf, terjadi error saat menghubungi Ollama: {response.status_code}"
+    except requests.exceptions.ConnectionError:
+        error_msg = "Tidak dapat terhubung ke Ollama. Pastikan Ollama sudah berjalan (jalankan: ollama serve)"
+        print(error_msg)
+        socketio.emit('stream_error', {
+            'session_id': session_id,
+            'error': error_msg
+        })
+        return error_msg
+    except requests.exceptions.Timeout:
+        error_msg = "Request timeout. Model Qwen memerlukan waktu terlalu lama untuk merespons."
+        print(error_msg)
+        socketio.emit('stream_error', {
+            'session_id': session_id,
+            'error': error_msg
+        })
+        return error_msg
+    except Exception as e:
+        error_msg = f"ERROR SAAT MENGHASILKAN JAWABAN: {e}"
+        print(error_msg)
+        socketio.emit('stream_error', {
+            'session_id': session_id,
+            'error': str(e)
+        })
+        return f"Maaf, saya mengalami error: {str(e)}"
+
+
 @app.route('/ask', methods=['POST'])
 def ask_api():
     data = request.json
@@ -229,6 +344,62 @@ def ask_api():
     except Exception as e:
         print(f"ERROR SAAT MEMPROSES QUERY: {e}")
         return jsonify({"error": f"TERJADI ERROR INTERNAL: {str(e)}"}), 500
+
+
+@socketio.on('ask_stream')
+def handle_ask_stream(data):
+    """HANDLER UNTUK SOCKETIO EVENT 'ask_stream' - STREAMING RESPONSE."""
+    try:
+        # Validasi input
+        if not data or 'query' not in data:
+            emit('stream_error', {
+                'error': 'TIDAK ADA QUERY YANG DISEDIAKAN'
+            })
+            return
+
+        if index_global is None or index_global.ntotal == 0:
+            emit('stream_error', {
+                'error': 'BELUM ADA DOKUMEN YANG DIINDEKS.'
+            })
+            return
+
+        query = data['query']
+        session_id = data.get('session_id', 'default')
+
+        # Validasi panjang query
+        MAX_QUERY_LENGTH = 1000
+        if len(query) > MAX_QUERY_LENGTH:
+            emit('stream_error', {
+                'error': f'QUERY MELEBIHI PANJANG MAKSIMUM {MAX_QUERY_LENGTH} KARAKTER.'
+            })
+            return
+
+        print(f"MENERIMA QUERY STREAMING: {query} (session: {session_id})")
+
+        # Ambil konteks yang relevan
+        contexts = retrieve_contexts(query, k=3)
+
+        if isinstance(contexts, list) and contexts and contexts[0].startswith("ERROR"):
+            emit('stream_error', {
+                'session_id': session_id,
+                'error': contexts[0]
+            })
+            return
+
+        # Emit konteks yang ditemukan
+        emit('stream_contexts', {
+            'session_id': session_id,
+            'contexts': contexts
+        })
+
+        # Generate jawaban dengan streaming
+        generate_answer_with_qwen_streaming(query, contexts, session_id)
+
+    except Exception as e:
+        print(f"ERROR SAAT MEMPROSES QUERY STREAMING: {e}")
+        emit('stream_error', {
+            'error': f'TERJADI ERROR INTERNAL: {str(e)}'
+        })
 
 
 # API UNTUK MENGUNGGAH FILE
@@ -373,5 +544,6 @@ if __name__ == '__main__':
     # MEMUAT MODEL DAN DOKUMEN SEBELUM SERVER DIMULAI
     load_all_models_and_docs()
 
-    # JALANKAN FLASK SERVER
-    app.run(host='0.0.0.0', port=9003, debug=False, threaded=True)
+    # JALANKAN FLASK SERVER DENGAN SOCKETIO SUPPORT
+    # Gunakan socketio.run() untuk mendukung WebSocket streaming
+    socketio.run(app, host='0.0.0.0', port=9003, debug=False, allow_unsafe_werkzeug=True)
