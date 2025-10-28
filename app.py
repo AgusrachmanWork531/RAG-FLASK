@@ -10,6 +10,7 @@ import threading
 import requests
 import json
 from flask_socketio import SocketIO, emit
+import re
 
 
 # --- KONFIGURASI ---
@@ -28,8 +29,8 @@ EMBEDDING_MODEL_NAME = 'paraphrase-multilingual-MiniLM-L12-v2'
 OLLAMA_MODEL_NAME = 'qwen2.5:7b'  # Ganti dengan qwen2.5:3b jika RAM terbatas
 OLLAMA_API_URL = 'http://localhost:11434/api/generate'  # Ollama default endpoint
 
-CHUNK_SIZE = 500
-CHUNK_OVERLAP = 50
+CHUNK_SIZE = 2000
+CHUNK_OVERLAP = 200
 
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
@@ -71,12 +72,82 @@ def get_text_from_file(filepath):
     return text
 
 
-# POTONG TEKS MENJADI BAGIAN-BAGIAN KECIL
+# POTONG TEKS MENJADI BAGIAN-BAGIAN KECIL (HYBRID CHUNKING)
 def chunk_text(text, source_filename):
+    """
+    Fungsi untuk memotong teks panjang menjadi chunk-chunk kecil
+    Menggunakan metode Hybrid: Semantic (paragraf/kalimat) + Fixed-size
+
+    Args:
+        text: Teks lengkap dari dokumen
+        source_filename: Nama file sumber (untuk tracking)
+
+    Returns:
+        List of dict: [{"text": "...", "source": "filename.pdf"}, ...]
+    """
+
+    # LANGKAH 1: Split by paragraf (semantic boundary level 1)
+    # \n\n = double newline untuk paragraf, bukan single newline
+    # Ini menghindari split per baris
+    paragraphs = text.split('\n\n')
+
+    # Container untuk menyimpan semua chunk hasil
     chunks = []
-    for i in range(0, len(text), CHUNK_SIZE - CHUNK_OVERLAP):
-        chunk_text = text[i:i + CHUNK_SIZE]
-        chunks.append({"text": chunk_text, "source": source_filename})
+    current_chunk = ""
+
+    # LANGKAH 2: Proses setiap paragraf
+    for para in paragraphs:
+        para = para.strip()
+        if not para:
+            continue
+
+        # CEK: Apakah menambahkan paragraf ini masih di bawah CHUNK_SIZE?
+        if len(current_chunk) + len(para) + 2 < CHUNK_SIZE:  # +2 untuk \n\n
+            # AMAN: Tambahkan paragraf ke chunk saat ini
+            if current_chunk:
+                current_chunk += "\n\n" + para
+            else:
+                current_chunk = para
+
+        else:
+            # Simpan chunk saat ini jika ada
+            if current_chunk:
+                chunks.append({
+                    "text": current_chunk,
+                    "source": source_filename
+                })
+
+            # CEK: Apakah paragraf baru terlalu panjang?
+            if len(para) > CHUNK_SIZE:
+                # LANGKAH 2A: Paragraf panjang → potong by kalimat
+                sentences = re.split(r'(?<=[.!?])\s+', para)
+                temp_chunk = ""
+
+                for sent in sentences:
+                    if len(temp_chunk) + len(sent) + 1 < CHUNK_SIZE:
+                        temp_chunk += " " + sent if temp_chunk else sent
+                    else:
+                        if temp_chunk:
+                            chunks.append({
+                                "text": temp_chunk.strip(),
+                                "source": source_filename
+                            })
+                        temp_chunk = sent
+
+                current_chunk = temp_chunk
+            else:
+                # Paragraf baru menjadi chunk baru
+                current_chunk = para
+
+    # Jangan lupa simpan sisa chunk terakhir
+    if current_chunk.strip():
+        chunks.append({
+            "text": current_chunk.strip(),
+            "source": source_filename
+        })
+
+    print(f"MENDETEKSI {len(chunks)} CHUNKS DARI FILE {source_filename}")
+    print(f"SAMPLE CHUNK LENGTHS: {[len(c['text']) for c in chunks[:3]]}")
     return chunks
 
 
@@ -374,8 +445,6 @@ def handle_ask_stream(data):
             })
             return
 
-        print(f"MENERIMA QUERY STREAMING: {query} (session: {session_id})")
-
         # Ambil konteks yang relevan
         contexts = retrieve_contexts(query, k=3)
 
@@ -391,7 +460,7 @@ def handle_ask_stream(data):
             'session_id': session_id,
             'contexts': contexts
         })
-
+        print(f"QUERY. : ${query} CONTEXTS: {contexts}")
         # Generate jawaban dengan streaming
         generate_answer_with_qwen_streaming(query, contexts, session_id)
 
@@ -546,4 +615,5 @@ if __name__ == '__main__':
 
     # JALANKAN FLASK SERVER DENGAN SOCKETIO SUPPORT
     # Gunakan socketio.run() untuk mendukung WebSocket streaming
-    socketio.run(app, host='0.0.0.0', port=9003, debug=False, allow_unsafe_werkzeug=True)
+    socketio.run(app, host='0.0.0.0', port=9003,
+                 debug=False, allow_unsafe_werkzeug=True)
